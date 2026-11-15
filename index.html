@@ -227,6 +227,10 @@ const QUAD_COLORS = ["#3cc8ff", "#ffaa3c", "#8cff6e", "#e66eff"];
 const MALLET_PARTIALS = [[1.0, 1.00, 1.00], [4.0, 0.35, 0.35], [6.0, 0.12, 0.18]];
 const SMOOTH_SEC_C = 0.05;
 const SMOOTH_STAGES = 5;
+const BIN_EMPHASIS = 2.0;   // higher = high bins stand out more
+const BIN_FLOOR = 0.05;     // how much bin .0 keeps (0 = silent)
+const BIN_BOOST = Array.from({length: N_BINS}, (_, b) =>
+  BIN_FLOOR + (1 - BIN_FLOOR) * Math.pow(b / (N_BINS - 1), BIN_EMPHASIS));
 
 const VIRIDIS_STOPS = [
   [68, 1, 84], [72, 40, 120], [62, 74, 137], [49, 104, 142], [38, 130, 142],
@@ -635,7 +639,7 @@ function renderLoop(nowMs) {
       const amp = fData.q[q].amp;
 
       for (let b = 0; b < N_BINS; b++) {
-        const tgt = gc * amp * gate * Math.sqrt(Math.max(0, fData.q[q].conc_eff[b]));
+        const tgt = gc * amp * gate * Math.sqrt(Math.max(0, fData.q[q].conc_eff[b])) * BIN_BOOST[b];
         const rise = Math.max(0, tgt - s_c[q][b]);
         flash_c[q][b] = isPlaying
           ? Math.max(flash_c[q][b] * Math.exp(-dt / CONC_FLASH_DECAY), Math.min(1.0, rise / CONC_FLASH_SENS))
