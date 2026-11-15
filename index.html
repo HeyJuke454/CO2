@@ -212,8 +212,8 @@ const CONC_NAMES = QUAD_META.map(m => Array.from({length: N_BINS}, (_, b) => lad
 
 const CONC_DETUNE = 0.0018;
 const BREATH_HZ = Array.from({length: N_BINS}, (_, i) => 0.08 + (0.22 - 0.08) * (i / (N_BINS - 1)));
-const CONC_GAIN = 1.2; // You can safely adjust this value (e.g. 0.3 to 0.6)
-const VORT_GAIN = 1.5;
+const CONC_GAIN = 0.4;
+const VORT_GAIN = 0.30;
 const PAD_NOTE_RMS = 0.41;
 const VU_DECAY = 0.35;
 const DB_MIN = -60.0, DB_MAX = -12.0;
@@ -242,7 +242,6 @@ let muted = false;
 let muteV = false;
 let muteC = false;
 let masterVol = 0.7;
-let hasStarted = false;
 
 let s_c = Array.from({length: 4}, () => new Float32Array(N_BINS));
 let c_stages = Array.from({length: SMOOTH_STAGES}, () => Array.from({length: 4}, () => new Float32Array(N_BINS)));
@@ -389,6 +388,7 @@ class WebSonifier {
     const scale = muted ? 0.0 : masterVol * (selectedQuad === -1 ? 0.55 : 0.85);
     this.scaleGain.gain.setTargetAtTime(scale, now, 0.02);
     this.vortBus.gain.setTargetAtTime(muteV ? 0.0 : 1.0, now, 0.02);
+    // Instantly mute CO2 pad when paused
     this.concBus.gain.setTargetAtTime((muteC || !isPlaying) ? 0.0 : 1.0, now, 0.015);
 
     for (let q = 0; q < 4; q++) {
@@ -408,7 +408,7 @@ class WebSonifier {
   }
 
   strikeVortex(ev) {
-    if (!this.initialized || muted || muteV || !hasStarted) return;
+    if (!this.initialized || muted || muteV || vidConc.paused) return;
     if (selectedQuad !== -1 && ev.quad !== selectedQuad) return;
 
     const now = this.ctx.currentTime;
@@ -496,19 +496,24 @@ async function boot() {
   }
 }
 
-async function startPlayback() {
-  if (hasStarted) return;
+async function togglePlay() {
   synth.init();
   if (synth.ctx.state === "suspended") {
     await synth.ctx.resume();
   }
 
-  vidMotion.currentTime = vidConc.currentTime;
-  await Promise.all([vidConc.play(), vidMotion.play()]);
-  hasStarted = true;
-  btnPlay.textContent = "Playing";
-  btnPlay.disabled = true;
-  synth.updateMixState(true);
+  if (vidConc.paused) {
+    vidMotion.currentTime = vidConc.currentTime;
+    await Promise.all([vidConc.play(), vidMotion.play()]);
+    btnPlay.textContent = "❚❚ Pause";
+    synth.updateMixState(true);
+  } else {
+    vidConc.pause();
+    vidMotion.pause();
+    vidMotion.currentTime = vidConc.currentTime;
+    btnPlay.textContent = "▶ Play";
+    synth.updateMixState(false);
+  }
 }
 
 function updateUIButtons() {
@@ -516,17 +521,17 @@ function updateUIButtons() {
   btnMuteV.classList.toggle("muted", muteV);
   btnMuteC.classList.toggle("muted", muteC);
   btnMuteAll.classList.toggle("muted", muted);
-  synth.updateMixState(hasStarted);
+  synth.updateMixState(!vidConc.paused);
 }
 
-btnPlay.addEventListener("click", startPlayback);
+btnPlay.addEventListener("click", togglePlay);
 btnAll.addEventListener("click", () => { selectedQuad = -1; updateUIButtons(); });
 btnMuteV.addEventListener("click", () => { muteV = !muteV; updateUIButtons(); });
 btnMuteC.addEventListener("click", () => { muteC = !muteC; updateUIButtons(); });
 btnMuteAll.addEventListener("click", () => { muted = !muted; updateUIButtons(); });
 volSlider.addEventListener("input", (e) => {
   masterVol = parseFloat(e.target.value);
-  synth.updateMixState(hasStarted);
+  synth.updateMixState(!vidConc.paused);
 });
 
 scrubber.addEventListener("mousedown", () => { isScrubbing = true; });
@@ -555,7 +560,7 @@ vidConc.addEventListener("ended", () => {
 });
 
 function handleMapClick(e, canvas) {
-  if (!hasStarted) startPlayback();
+  synth.init();
   const rect = canvas.getBoundingClientRect();
   const nx = (e.clientX - rect.left) / rect.width;
   const ny = (e.clientY - rect.top) / rect.height;
@@ -569,7 +574,8 @@ canvasConc.addEventListener("click", (e) => handleMapClick(e, canvasConc));
 canvasMotion.addEventListener("click", (e) => handleMapClick(e, canvasMotion));
 
 window.addEventListener("keydown", (e) => {
-  if (e.key === "f" || e.key === "F") { selectedQuad = -1; updateUIButtons(); }
+  if (e.code === "Space") { e.preventDefault(); togglePlay(); }
+  else if (e.key === "f" || e.key === "F") { selectedQuad = -1; updateUIButtons(); }
   else if (e.key === "m" || e.key === "M") { muted = !muted; updateUIButtons(); }
   else if (e.key === "v" || e.key === "V") { muteV = !muteV; updateUIButtons(); }
   else if (e.key === "c" || e.key === "C") { muteC = !muteC; updateUIButtons(); }
@@ -587,6 +593,7 @@ function renderLoop(nowMs) {
   lastAnimTime = nowMs;
 
   if (sonData) {
+    const isPlaying = !vidConc.paused;
     const curT = vidConc.currentTime || 0;
 
     if (!isScrubbing) {
@@ -602,7 +609,7 @@ function renderLoop(nowMs) {
     );
     const fData = sonData.frames[frameIdx];
 
-    if (hasStarted && frameIdx !== lastFrameIdx) {
+    if (isPlaying && frameIdx !== lastFrameIdx) {
       if (frameIdx > lastFrameIdx && frameIdx - lastFrameIdx <= 6) {
         for (let idx = lastFrameIdx + 1; idx <= frameIdx; idx++) {
           for (const ev of sonData.frames[idx].ev) {
@@ -620,17 +627,17 @@ function renderLoop(nowMs) {
 
     const tau = SMOOTH_SEC_C / Math.sqrt(SMOOTH_STAGES);
     const alpha = 1.0 - Math.exp(-dt / tau);
-    const outScale = (muted || !hasStarted ? 0.0 : masterVol) * (selectedQuad === -1 ? 0.55 : 0.85);
+    const outScale = (muted || !isPlaying ? 0.0 : masterVol) * (selectedQuad === -1 ? 0.55 : 0.85);
 
     for (let q = 0; q < 4; q++) {
       const gate = (selectedQuad === -1 || selectedQuad === q) ? 1.0 : 0.0;
-      const gc = (muteC || !hasStarted) ? 0.0 : 1.0;
+      const gc = (muteC || !isPlaying) ? 0.0 : 1.0;
       const amp = fData.q[q].amp;
 
       for (let b = 0; b < N_BINS; b++) {
         const tgt = gc * amp * gate * Math.sqrt(Math.max(0, fData.q[q].conc_eff[b]));
         const rise = Math.max(0, tgt - s_c[q][b]);
-        flash_c[q][b] = hasStarted
+        flash_c[q][b] = isPlaying
           ? Math.max(flash_c[q][b] * Math.exp(-dt / CONC_FLASH_DECAY), Math.min(1.0, rise / CONC_FLASH_SENS))
           : 0.0;
 
@@ -763,7 +770,7 @@ function drawDashboard(ctx, fData, curT) {
     : `SOLO AUDIO: ${QUAD_META[selectedQuad].name}`;
   let modeCol = selectedQuad === -1 ? "#00d2ff" : "#50ffa0";
   if (muted) { modeTxt += " [MUTED]"; modeCol = "#ff5a5a"; }
-  else if (!hasStarted) { modeTxt += " [CLICK PLAY]"; modeCol = "#aaa"; }
+  else if (vidConc.paused) { modeTxt += " [PAUSED]"; modeCol = "#aaa"; }
 
   ctx.fillStyle = modeCol;
   ctx.font = "12px sans-serif";
