@@ -558,17 +558,17 @@ scrubber.addEventListener("touchend", () => { isScrubbing = false; });
 
 vidConc.addEventListener("loadedmetadata", () => {
   scrubber.max = vidConc.duration || 10;
+  // Force browser to decode the first frame so canvas isn't black before hitting play
+  vidConc.currentTime = 0.1;
+  vidMotion.currentTime = 0.1;
 });
 
-vidConc.addEventListener("ended", () => {
-  vidConc.currentTime = 0;
-  vidMotion.currentTime = 0;
-  syncedMediaTime = 0;
-  strikeLog = [];
-  lastFrameIdx = -1;
-  vidConc.play();
-  vidMotion.play();
-});
+vidConc.addEventListener("seeked", () => {
+  if (vidConc.paused) {
+    vidConc.currentTime = 0;
+    vidMotion.currentTime = 0;
+  }
+}, { once: true });
 
 function handleMapClick(e, canvas) {
   synth.init();
