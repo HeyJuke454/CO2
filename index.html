@@ -214,6 +214,13 @@ const CONC_DETUNE = 0.0018;
 const BREATH_HZ = Array.from({length: N_BINS}, (_, i) => 0.08 + (0.22 - 0.08) * (i / (N_BINS - 1)));
 const CONC_GAIN = 1.2;
 const VORT_GAIN = 1.0;
+
+// Sustained vortex layer: the mallet remains the attack, while this adds
+// an airy, slowly moving body for as long as a tracked vortex persists.
+const VORTEX_BED_GAIN = 0.045;
+const VORTEX_BED_MAX_VOICES = 16;
+const VORTEX_MATCH_DIST = 0.14;       // normalized position tolerance
+const VORTEX_RELEASE_SEC = 0.28;
 const PAD_NOTE_RMS = 0.41;
 const VU_DECAY = 0.35;
 const DB_MIN = -60.0, DB_MAX = -12.0;
@@ -267,6 +274,8 @@ class WebSonifier {
     this.quadGains = [];
     this.vortBus = null;
     this.concBus = null;
+    this.vortexVoices = [];
+    this.vortexVoiceSerial = 0;
   }
 
   init() {
@@ -409,6 +418,183 @@ class WebSonifier {
         this.padVoices[q][b].gain.setTargetAtTime(smoothedLevels[q][b], now, 0.02);
       }
     }
+  }
+
+  createVortexBedVoice(marker) {
+    const now = this.ctx.currentTime;
+
+    // A soft fundamental plus a quiet upper partial gives the sustained
+    // layer a little air without losing the pentatonic musical character.
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.value = 1500;
+    filter.Q.value = 0.7;
+
+    const amp = this.ctx.createGain();
+    amp.gain.value = 0.0001;
+
+    const panner = this.ctx.createStereoPanner();
+    panner.pan.value = Math.max(-1, Math.min(1, marker.x * 2 - 1));
+
+    const osc = this.ctx.createOscillator();
+    osc.type = "sine";
+
+    const upper = this.ctx.createOscillator();
+    upper.type = "triangle";
+    const upperGain = this.ctx.createGain();
+    upperGain.gain.value = 0.075;
+
+    // Slow pitch wobble: more like a living, turning fluid structure than
+    // a static drone. Its depth and rate are adjusted as the marker moves.
+    const vibrato = this.ctx.createOscillator();
+    vibrato.type = "sine";
+    vibrato.frequency.value = 0.32;
+    const vibratoDepth = this.ctx.createGain();
+    vibratoDepth.gain.value = 0.6;
+    vibrato.connect(vibratoDepth);
+    vibratoDepth.connect(osc.frequency);
+
+    // Gentle breathing/pulsing, scaled with the voice's own amplitude.
+    const tremolo = this.ctx.createOscillator();
+    tremolo.type = "sine";
+    tremolo.frequency.value = 0.42;
+    const tremoloDepth = this.ctx.createGain();
+    tremoloDepth.gain.value = 0.0;
+    tremolo.connect(tremoloDepth);
+    tremoloDepth.connect(amp.gain);
+
+    osc.connect(filter);
+    upper.connect(upperGain);
+    upperGain.connect(filter);
+    filter.connect(amp);
+    amp.connect(panner);
+    panner.connect(this.vortBus);
+
+    osc.start(now);
+    upper.start(now);
+    vibrato.start(now);
+    tremolo.start(now);
+
+    const serial = this.vortexVoiceSerial++;
+    return {
+      x: marker.x,
+      y: marker.y,
+      q: marker.q,
+      phase: serial * 2.399963229728653,
+      lastSeen: now,
+      releasing: false,
+      releaseAt: 0,
+      osc, upper, upperGain, filter, amp, panner,
+      vibrato, vibratoDepth, tremolo, tremoloDepth
+    };
+  }
+
+  updateVortexBed(markers, isPlaying) {
+    if (!this.initialized) return;
+
+    const now = this.ctx.currentTime;
+    const aspect = (sonData && sonData.height)
+      ? sonData.width / sonData.height : 1.0;
+    const unmatched = new Set(this.vortexVoices);
+
+    const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+    const validMarkers = Array.isArray(markers) ? markers : [];
+
+    for (const mk of validMarkers) {
+      if (!Number.isFinite(mk.x) || !Number.isFinite(mk.y)) continue;
+
+      // Match this frame's marker to the nearest existing voice in the
+      // same quadrant. The JSON markers have no persistent ID, so position
+      // continuity is used to follow each vortex between frames.
+      let best = null;
+      let bestDist = VORTEX_MATCH_DIST;
+      for (const voice of unmatched) {
+        if (voice.q !== mk.q) continue;
+        const dx = (voice.x - mk.x) * aspect;
+        const dy = voice.y - mk.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist < bestDist) {
+          best = voice;
+          bestDist = dist;
+        }
+      }
+
+      const selected = (selectedQuad === -1 || mk.q === selectedQuad);
+      const shouldSound = isPlaying && !muted && !muteV && selected && !!mk.aud;
+
+      if (best) {
+        unmatched.delete(best);
+      } else if (shouldSound && this.vortexVoices.length < VORTEX_BED_MAX_VOICES) {
+        best = this.createVortexBedVoice(mk);
+        this.vortexVoices.push(best);
+      } else {
+        continue;
+      }
+
+      // Smooth marker motion so pitch and pan do not jump from frame to frame.
+      best.x = 0.65 * mk.x + 0.35 * best.x;
+      best.y = 0.65 * mk.y + 0.35 * best.y;
+      best.q = mk.q;
+      best.lastSeen = now;
+      best.releasing = false;
+
+      const rung = RUNG_LO + (1.0 - clamp(best.y, 0, 1)) * (RUNG_HI - RUNG_LO);
+      const freq = ladderFreq(Math.round(rung));
+      const sizePx = Math.max(0, (mk.r || 0) * (sonData ? sonData.width : 640));
+      const sizeFactor = clamp(sizePx / 34.0, 0, 1);
+
+      // Larger vortices have a fuller, slightly brighter sustained body.
+      // Marker size is used here because it is present in the supplied
+      // sonification_data.json marker records.
+      const baseAmp = shouldSound
+        ? VORTEX_BED_GAIN * (0.55 + 0.45 * sizeFactor)
+        : 0.0;
+
+      best.osc.frequency.setTargetAtTime(freq, now, 0.16);
+      best.upper.frequency.setTargetAtTime(freq * 2.01, now, 0.16);
+      best.filter.frequency.setTargetAtTime(900 + 1900 * sizeFactor, now, 0.22);
+      best.vibrato.frequency.setTargetAtTime(0.22 + 0.22 * (1 - sizeFactor), now, 0.25);
+      best.vibratoDepth.gain.setTargetAtTime(0.35 + 0.9 * sizeFactor, now, 0.25);
+      best.tremolo.frequency.setTargetAtTime(0.28 + 0.32 * (1 - sizeFactor), now, 0.25);
+
+      // The stereo position follows the vortex, with a slow orbit layered on top.
+      const basePan = clamp(best.x * 2 - 1, -1, 1);
+      const orbitHz = 0.10 + 0.18 * (1 - sizeFactor);
+      const orbitDepth = 0.10 + 0.12 * (1 - sizeFactor);
+      const orbit = Math.sin(now * 2 * Math.PI * orbitHz + best.phase) * orbitDepth;
+      best.panner.pan.setTargetAtTime(clamp(basePan + orbit, -1, 1), now, 0.10);
+
+      best.amp.gain.setTargetAtTime(Math.max(0.0001, baseAmp * 0.78), now, 0.13);
+      best.tremoloDepth.gain.setTargetAtTime(baseAmp * 0.22, now, 0.13);
+    }
+
+    // A vortex that is no longer detected fades away rather than stopping
+    // abruptly. If it reappears shortly afterwards, its voice can be reused.
+    for (const voice of unmatched) {
+      if (!voice.releasing) {
+        voice.releasing = true;
+        voice.releaseAt = now;
+      }
+      voice.amp.gain.setTargetAtTime(0.0001, now, VORTEX_RELEASE_SEC);
+      voice.tremoloDepth.gain.setTargetAtTime(0.0, now, 0.10);
+    }
+
+    this.vortexVoices = this.vortexVoices.filter(voice => {
+      if (voice.releasing && now - voice.releaseAt > 1.6) {
+        for (const node of [voice.osc, voice.upper, voice.vibrato, voice.tremolo]) {
+          try { node.stop(now); } catch (_) {}
+        }
+        for (const node of [
+          voice.osc, voice.upper, voice.upperGain, voice.filter, voice.amp,
+          voice.panner, voice.vibrato, voice.vibratoDepth,
+          voice.tremolo, voice.tremoloDepth
+        ]) {
+          try { node.disconnect(); } catch (_) {}
+        }
+        return false;
+      }
+      return true;
+    });
   }
 
   strikeVortex(ev) {
@@ -612,6 +798,10 @@ function renderLoop(nowMs) {
       Math.max(0, Math.round(curT * sonData.fps))
     );
     const fData = sonData.frames[frameIdx];
+
+    // Continuous vortex body follows the tracked markers every animation frame;
+    // the precomputed strike events below remain the per-vortex attack.
+    synth.updateVortexBed(fData.mk, isPlaying);
 
     if (isPlaying && frameIdx !== lastFrameIdx) {
       if (frameIdx > lastFrameIdx && frameIdx - lastFrameIdx <= 6) {
