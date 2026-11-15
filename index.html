@@ -132,7 +132,15 @@
       flex-wrap: wrap;
       gap: 8px;
     }
-    video { display: none; }
+    /* Ensure video elements are properly decoded by the browser without visual clutter */
+    .hidden-media {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      opacity: 0.001;
+      pointer-events: none;
+      overflow: hidden;
+    }
   </style>
 </head>
 <body>
@@ -142,7 +150,7 @@
     <button id="btnPlay">▶ Play</button>
     <div class="scrubber-wrap">
       <input type="range" id="scrubber" min="0" max="100" step="0.01" value="0" />
-      <span id="timeLabel" style="font-size:12px; font-variant-numeric:tabular-nums; color:#aaa;">00:00</span>
+      <span id="timeLabel" style="font-size:12px; font-variant-numeric:tabular-nums; color:#aaa;">0:00</span>
     </div>
     <button id="btnAll" title="Hear all 4 quadrants (F)">All 4 Quads</button>
     <button id="btnMuteV" title="Toggle Vortex Instrument (V)">Vortex [V]</button>
@@ -174,12 +182,12 @@
   </div>
 </div>
 
-<video id="vidConc" src="input.mp4" muted playsinline preload="auto" crossorigin="anonymous"></video>
-<video id="vidMotion" src="motion.mp4" muted playsinline preload="auto" crossorigin="anonymous"></video>
+<video id="vidConc" class="hidden-media" src="input.mp4" muted playsinline preload="auto" crossorigin="anonymous"></video>
+<video id="vidMotion" class="hidden-media" src="motion.mp4" muted playsinline preload="auto" crossorigin="anonymous"></video>
 
 <script>
 // ============================================================================
-// MUSICAL & VISUAL CONSTANTS (Mirrors Python script)
+// MUSICAL & VISUAL CONSTANTS
 // ============================================================================
 const C_ROOT = 130.8128;
 const PENTA = [1.0, 9 / 8, 5 / 4, 3 / 2, 5 / 3];
@@ -216,12 +224,11 @@ const LIT_REL = 0.40;
 const GLOW = 0.75;
 const ROLL_SEC = 12.0;
 const RUNG_LO = 3, RUNG_HI = 17;
-const QUAD_COLORS = ["#3cc8ff", "#ffaa3c", "#8cff6e", "#e66eff"]; // RGB equivalents
+const QUAD_COLORS = ["#3cc8ff", "#ffaa3c", "#8cff6e", "#e66eff"];
 const MALLET_PARTIALS = [[1.0, 1.00, 1.00], [4.0, 0.35, 0.35], [6.0, 0.12, 0.18]];
 const SMOOTH_SEC_C = 0.05;
 const SMOOTH_STAGES = 5;
 
-// Viridis colormap LUT (10 stops matching OpenCV COLORMAP_VIRIDIS)
 const VIRIDIS_STOPS = [
   [68, 1, 84], [72, 40, 120], [62, 74, 137], [49, 104, 142], [38, 130, 142],
   [31, 158, 137], [53, 183, 121], [109, 205, 89], [180, 222, 44], [253, 231, 37]
@@ -231,13 +238,12 @@ const VIRIDIS_STOPS = [
 // APPLICATION STATE
 // ============================================================================
 let sonData = null;
-let selectedQuad = 0; // 0..3 = Solo, -1 = All 4
+let selectedQuad = 0;
 let muted = false;
 let muteV = false;
 let muteC = false;
 let masterVol = 0.7;
 
-// Chart animation state
 let s_c = Array.from({length: 4}, () => new Float32Array(N_BINS));
 let c_stages = Array.from({length: SMOOTH_STAGES}, () => Array.from({length: 4}, () => new Float32Array(N_BINS)));
 let flash_c = Array.from({length: 4}, () => new Float32Array(N_BINS));
@@ -245,6 +251,7 @@ let vu_c = Array.from({length: 4}, () => new Float32Array(N_BINS));
 let strikeLog = [];
 let lastFrameIdx = -1;
 let lastAnimTime = performance.now();
+let isScrubbing = false;
 
 // ============================================================================
 // WEB AUDIO SYNTHESIS ENGINE
@@ -253,11 +260,10 @@ class WebSonifier {
   constructor() {
     this.ctx = null;
     this.initialized = false;
-    this.padVoices = []; // [4][10]
-    this.quadGains = []; // [4]
+    this.padVoices = [];
+    this.quadGains = [];
     this.vortBus = null;
     this.concBus = null;
-    this.masterGain = null;
   }
 
   init() {
@@ -265,10 +271,9 @@ class WebSonifier {
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     this.ctx = new AudioCtx();
 
-    // Master chain: Dry/Wet Diffuse Reverb -> Output Scale -> Tanh Soft Limiter -> Destination
     this.dryGain = this.ctx.createGain();
     this.wetGain = this.ctx.createGain();
-    this.dryGain.gain.value = 0.0; // BLUR_MIX = 1.0
+    this.dryGain.gain.value = 0.0;
     this.wetGain.gain.value = 1.0;
 
     const convolver = this.ctx.createConvolver();
@@ -295,7 +300,6 @@ class WebSonifier {
     this.scaleGain.connect(shaper);
     shaper.connect(this.ctx.destination);
 
-    // Build 40 sustained CO2 Pad voices (4 quadrants x 10 bins)
     for (let q = 0; q < 4; q++) {
       const qGain = this.ctx.createGain();
       qGain.gain.value = 1.0;
@@ -311,7 +315,6 @@ class WebSonifier {
         const noteGain = this.ctx.createGain();
         noteGain.gain.value = 0.0;
 
-        // Breathing LFO (0.8 + 0.2 * sin)
         const breathGain = this.ctx.createGain();
         breathGain.gain.value = 0.8;
         const lfo = this.ctx.createOscillator();
@@ -322,7 +325,6 @@ class WebSonifier {
         lfoDepth.connect(breathGain.gain);
         lfo.start();
 
-        // Two detuned sines
         const osc1 = this.ctx.createOscillator();
         const osc2 = this.ctx.createOscillator();
         osc1.type = "sine";
@@ -359,7 +361,6 @@ class WebSonifier {
       for (let i = 0; i < len; i++) {
         const t = i / sr;
         const env = (1.0 - Math.exp(-t / 0.02)) * Math.exp(-t / (seconds / 6.9));
-        // Box-Muller normal noise
         const u1 = Math.max(1e-7, Math.random());
         const u2 = Math.random();
         const z = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
@@ -382,13 +383,14 @@ class WebSonifier {
     return curve;
   }
 
-  updateMixState() {
+  updateMixState(isPlaying) {
     if (!this.initialized) return;
     const now = this.ctx.currentTime;
     const scale = muted ? 0.0 : masterVol * (selectedQuad === -1 ? 0.55 : 0.85);
     this.scaleGain.gain.setTargetAtTime(scale, now, 0.02);
     this.vortBus.gain.setTargetAtTime(muteV ? 0.0 : 1.0, now, 0.02);
-    this.concBus.gain.setTargetAtTime(muteC ? 0.0 : 1.0, now, 0.02);
+    // Instantly mute CO2 pad when paused
+    this.concBus.gain.setTargetAtTime((muteC || !isPlaying) ? 0.0 : 1.0, now, 0.015);
 
     for (let q = 0; q < 4; q++) {
       const active = (selectedQuad === -1 || selectedQuad === q) ? 1.0 : 0.0;
@@ -407,7 +409,7 @@ class WebSonifier {
   }
 
   strikeVortex(ev) {
-    if (!this.initialized || muted || muteV) return;
+    if (!this.initialized || muted || muteV || vidConc.paused) return;
     if (selectedQuad !== -1 && ev.quad !== selectedQuad) return;
 
     const now = this.ctx.currentTime;
@@ -438,7 +440,6 @@ class WebSonifier {
       osc.stop(now + dur + 0.02);
     }
 
-    // Short mallet click transient
     const clickDur = 0.015;
     const clickBuf = this.ctx.createBuffer(1, Math.floor(this.ctx.sampleRate * clickDur), this.ctx.sampleRate);
     const cData = clickBuf.getChannelData(0);
@@ -463,9 +464,9 @@ const vidMotion = document.getElementById("vidMotion");
 const canvasConc = document.getElementById("canvasConc");
 const canvasMotion = document.getElementById("canvasMotion");
 const chartCanvas = document.getElementById("chartCanvas");
-const ctxConc = canvasConc.getContext("2d");
-const ctxMotion = canvasMotion.getContext("2d");
-const ctxChart = chartCanvas.getContext("2d");
+const ctxConc = canvasConc.getContext("2d", { alpha: false });
+const ctxMotion = canvasMotion.getContext("2d", { alpha: false });
+const ctxChart = chartCanvas.getContext("2d", { alpha: false });
 
 const btnPlay = document.getElementById("btnPlay");
 const btnAll = document.getElementById("btnAll");
@@ -491,23 +492,29 @@ async function boot() {
     updateUIButtons();
     requestAnimationFrame(renderLoop);
   } catch (err) {
-    statusText.textContent = "Error loading sonification_data.json (run over HTTP/GitHub Pages)";
+    statusText.textContent = "Error loading sonification_data.json";
     console.error(err);
   }
 }
 
-function togglePlay() {
+async function togglePlay() {
   synth.init();
-  if (synth.ctx.state === "suspended") synth.ctx.resume();
+  if (synth.ctx.state === "suspended") {
+    await synth.ctx.resume();
+  }
 
   if (vidConc.paused) {
-    vidConc.play();
-    vidMotion.play();
+    // Ensure both videos match current time before playing together naturally
+    vidMotion.currentTime = vidConc.currentTime;
+    await Promise.all([vidConc.play(), vidMotion.play()]);
     btnPlay.textContent = "❚❚ Pause";
+    synth.updateMixState(true);
   } else {
     vidConc.pause();
     vidMotion.pause();
+    vidMotion.currentTime = vidConc.currentTime;
     btnPlay.textContent = "▶ Play";
+    synth.updateMixState(false);
   }
 }
 
@@ -516,7 +523,7 @@ function updateUIButtons() {
   btnMuteV.classList.toggle("muted", muteV);
   btnMuteC.classList.toggle("muted", muteC);
   btnMuteAll.classList.toggle("muted", muted);
-  synth.updateMixState();
+  synth.updateMixState(!vidConc.paused);
 }
 
 btnPlay.addEventListener("click", togglePlay);
@@ -526,9 +533,11 @@ btnMuteC.addEventListener("click", () => { muteC = !muteC; updateUIButtons(); })
 btnMuteAll.addEventListener("click", () => { muted = !muted; updateUIButtons(); });
 volSlider.addEventListener("input", (e) => {
   masterVol = parseFloat(e.target.value);
-  synth.updateMixState();
+  synth.updateMixState(!vidConc.paused);
 });
 
+scrubber.addEventListener("mousedown", () => { isScrubbing = true; });
+scrubber.addEventListener("touchstart", () => { isScrubbing = true; }, { passive: true });
 scrubber.addEventListener("input", (e) => {
   const t = parseFloat(e.target.value);
   vidConc.currentTime = t;
@@ -536,6 +545,8 @@ scrubber.addEventListener("input", (e) => {
   strikeLog = [];
   lastFrameIdx = -1;
 });
+scrubber.addEventListener("mouseup", () => { isScrubbing = false; });
+scrubber.addEventListener("touchend", () => { isScrubbing = false; });
 
 vidConc.addEventListener("loadedmetadata", () => {
   scrubber.max = vidConc.duration || 10;
@@ -584,26 +595,24 @@ function renderLoop(nowMs) {
   lastAnimTime = nowMs;
 
   if (sonData) {
-    // Keep motion video tightly locked to concentration video
-    if (!vidConc.paused && Math.abs(vidConc.currentTime - vidMotion.currentTime) > 0.04) {
-      vidMotion.currentTime = vidConc.currentTime;
-    }
-
+    const isPlaying = !vidConc.paused;
     const curT = vidConc.currentTime || 0;
-    scrubber.value = curT;
+
+    if (!isScrubbing) {
+      scrubber.value = curT;
+    }
     const mins = Math.floor(curT / 60);
     const secs = Math.floor(curT % 60).toString().padStart(2, "0");
     timeLabel.textContent = `${mins}:${secs}`;
 
     const frameIdx = Math.min(
       sonData.frames.length - 1,
-      Math.max(0, Math.floor(curT * sonData.fps))
+      Math.max(0, Math.round(curT * sonData.fps))
     );
     const fData = sonData.frames[frameIdx];
 
-    // Trigger vortex strike events once per newly entered frame during playback
-    if (!vidConc.paused && frameIdx !== lastFrameIdx) {
-      if (frameIdx > lastFrameIdx && frameIdx - lastFrameIdx <= 5) {
+    if (isPlaying && frameIdx !== lastFrameIdx) {
+      if (frameIdx > lastFrameIdx && frameIdx - lastFrameIdx <= 6) {
         for (let idx = lastFrameIdx + 1; idx <= frameIdx; idx++) {
           for (const ev of sonData.frames[idx].ev) {
             synth.strikeVortex(ev);
@@ -614,25 +623,25 @@ function renderLoop(nowMs) {
       lastFrameIdx = frameIdx;
     }
 
-    // Prune strike roll older than ROLL_SEC
     while (strikeLog.length && (curT - strikeLog[0].t > ROLL_SEC || curT < strikeLog[0].t)) {
       strikeLog.shift();
     }
 
-    // Update 5-stage temporal smoothing & VU meters for CO2 Pad
     const tau = SMOOTH_SEC_C / Math.sqrt(SMOOTH_STAGES);
     const alpha = 1.0 - Math.exp(-dt / tau);
-    const outScale = (muted ? 0.0 : masterVol) * (selectedQuad === -1 ? 0.55 : 0.85);
+    const outScale = (muted || !isPlaying ? 0.0 : masterVol) * (selectedQuad === -1 ? 0.55 : 0.85);
 
     for (let q = 0; q < 4; q++) {
       const gate = (selectedQuad === -1 || selectedQuad === q) ? 1.0 : 0.0;
-      const gc = muteC ? 0.0 : 1.0;
+      const gc = (muteC || !isPlaying) ? 0.0 : 1.0;
       const amp = fData.q[q].amp;
 
       for (let b = 0; b < N_BINS; b++) {
         const tgt = gc * amp * gate * Math.sqrt(Math.max(0, fData.q[q].conc_eff[b]));
         const rise = Math.max(0, tgt - s_c[q][b]);
-        flash_c[q][b] = Math.max(flash_c[q][b] * Math.exp(-dt / CONC_FLASH_DECAY), Math.min(1.0, rise / CONC_FLASH_SENS));
+        flash_c[q][b] = isPlaying
+          ? Math.max(flash_c[q][b] * Math.exp(-dt / CONC_FLASH_DECAY), Math.min(1.0, rise / CONC_FLASH_SENS))
+          : 0.0;
 
         let x = tgt;
         for (let st = 0; st < SMOOTH_STAGES; st++) {
@@ -648,7 +657,6 @@ function renderLoop(nowMs) {
 
     synth.updatePadLevels(s_c);
 
-    // Draw Video Panels + Quadrant & Vortex Overlays
     drawVideoPanel(ctxConc, vidConc, fData, false);
     drawVideoPanel(ctxMotion, vidMotion, fData, true);
     drawDashboard(ctxChart, fData, curT);
@@ -660,13 +668,14 @@ function renderLoop(nowMs) {
 function drawVideoPanel(ctx, videoEl, fData, isMotion) {
   const W = ctx.canvas.width;
   const H = ctx.canvas.height;
-  ctx.clearRect(0, 0, W, H);
 
   if (videoEl.readyState >= 2) {
     ctx.drawImage(videoEl, 0, 0, W, H);
+  } else {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
   }
 
-  // Spotlight selected quadrant on motion map
   if (isMotion && selectedQuad !== -1) {
     ctx.fillStyle = "rgba(0, 0, 0, 0.72)";
     const mw = W / 2, mh = H / 2;
@@ -678,7 +687,6 @@ function drawVideoPanel(ctx, videoEl, fData, isMotion) {
     }
   }
 
-  // Quadrant Grid
   ctx.strokeStyle = "rgba(160, 160, 160, 0.6)";
   ctx.lineWidth = 1;
   ctx.beginPath();
@@ -686,7 +694,6 @@ function drawVideoPanel(ctx, videoEl, fData, isMotion) {
   ctx.moveTo(0, H / 2); ctx.lineTo(W, H / 2);
   ctx.stroke();
 
-  // Quadrant Labels & Volume Meters
   ctx.font = "12px sans-serif";
   for (let q = 0; q < 4; q++) {
     const qx = (q % 2) * (W / 2);
@@ -712,7 +719,6 @@ function drawVideoPanel(ctx, videoEl, fData, isMotion) {
     }
   }
 
-  // Draw Tracked Vortex Markers & Strike Ripples
   for (const mk of fData.mk) {
     if (selectedQuad !== -1 && mk.q !== selectedQuad) continue;
     const x = mk.x * W;
@@ -738,7 +744,6 @@ function drawVideoPanel(ctx, videoEl, fData, isMotion) {
     }
   }
 
-  // Panel Caption
   ctx.fillStyle = "rgba(0, 0, 0, 0.55)";
   ctx.fillRect(0, H - 22, W, 22);
   ctx.fillStyle = "#ddd";
@@ -758,7 +763,6 @@ function drawDashboard(ctx, fData, curT) {
   ctx.fillStyle = "#161616";
   ctx.fillRect(0, 0, W, H);
 
-  // Header
   ctx.fillStyle = "#ebebeb";
   ctx.font = "bold 14px sans-serif";
   ctx.fillText("SONIFICATION OUTPUT & SPECTRUM", 18, 26);
@@ -768,12 +772,12 @@ function drawDashboard(ctx, fData, curT) {
     : `SOLO AUDIO: ${QUAD_META[selectedQuad].name}`;
   let modeCol = selectedQuad === -1 ? "#00d2ff" : "#50ffa0";
   if (muted) { modeTxt += " [MUTED]"; modeCol = "#ff5a5a"; }
+  else if (vidConc.paused) { modeTxt += " [PAUSED]"; modeCol = "#aaa"; }
 
   ctx.fillStyle = modeCol;
   ctx.font = "12px sans-serif";
   ctx.fillText(modeTxt, 18, 46);
 
-  // Gauges
   const dispStat = selectedQuad === -1 ? fData.all : fData.q[selectedQuad];
   let nTr = 0, nAud = 0;
   for (const mk of fData.mk) {
@@ -799,10 +803,8 @@ function drawDashboard(ctx, fData, curT) {
   const mid = top + Math.floor((bot - top) / 2);
   const x0 = 50, x1 = W - 20;
 
-  // 1. Vortex Strike Roll
   drawStrikeRoll(ctx, x0, x1, top, mid - 8, curT, muteV || muted);
 
-  // 2. CO2 Pad Output Histogram
   const outC = new Float32Array(N_BINS);
   const flC = new Float32Array(N_BINS);
   for (let b = 0; b < N_BINS; b++) {
@@ -822,7 +824,6 @@ function drawDashboard(ctx, fData, curT) {
   const namesC = selectedQuad === -1 ? null : CONC_NAMES[selectedQuad];
   drawLevelHistogram(ctx, x0, x1, mid + 8, bot, outC, flC, namesC, muteC || muted);
 
-  // Bottom 4-Quadrant Strip
   const sy0 = H - 54;
   const cardW = (W - 36 - 18) / 4;
   for (let q = 0; q < 4; q++) {
