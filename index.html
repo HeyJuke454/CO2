@@ -215,12 +215,13 @@ const BREATH_HZ = Array.from({length: N_BINS}, (_, i) => 0.08 + (0.22 - 0.08) * 
 const CONC_GAIN = 1.2;
 const VORT_GAIN = 1.0;
 
-// Sustained vortex layer: the mallet remains the attack, while this adds
-// an airy, slowly moving body for as long as a tracked vortex persists.
-const VORTEX_BED_GAIN = 0.18;
+// Sustained vortex layer: soft, breath-like tones rather than a siren-like
+// pitch sweep. Each vortex keeps the note it starts on; motion is expressed
+// mostly through gentle spatial drift and a quiet filtered-noise layer.
+const VORTEX_BED_GAIN = 0.030;
 const VORTEX_BED_MAX_VOICES = 16;
-const VORTEX_MATCH_DIST = 0.18;       // normalized position tolerance
-const VORTEX_RELEASE_SEC = 0.28;
+const VORTEX_MATCH_DIST = 0.14;       // normalized position tolerance
+const VORTEX_RELEASE_SEC = 0.75;
 const PAD_NOTE_RMS = 0.41;
 const VU_DECAY = 0.35;
 const DB_MIN = -60.0, DB_MAX = -12.0;
@@ -231,7 +232,7 @@ const GLOW = 0.75;
 const ROLL_SEC = 12.0;
 const RUNG_LO = 3, RUNG_HI = 17;
 const QUAD_COLORS = ["#3cc8ff", "#ffaa3c", "#8cff6e", "#e66eff"];
-const MALLET_PARTIALS = [[1.0, 1.00, 1.00], [4.0, 0.35, 0.35], [6.0, 0.12, 0.18]];
+const MALLET_PARTIALS = [[1.0, 1.00, 1.00], [2.0, 0.12, 0.55], [3.0, 0.035, 0.30]];
 const SMOOTH_SEC_C = 0.05;
 const SMOOTH_STAGES = 5;
 const BIN_EMPHASIS = 3.0;   // higher = high bins stand out more
@@ -423,69 +424,90 @@ class WebSonifier {
   createVortexBedVoice(marker) {
     const now = this.ctx.currentTime;
 
-    // A soft fundamental plus a quiet upper partial gives the sustained
-    // layer a little air without losing the pentatonic musical character.
-    const filter = this.ctx.createBiquadFilter();
-    filter.type = "lowpass";
-    filter.frequency.value = 1500;
-    filter.Q.value = 0.7;
+    // Choose a note once, when the vortex appears. Keeping the pitch stable
+    // avoids the repeated up/down glide that can make the instrument sound
+    // like an emergency siren.
+    const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+    const rung = Math.round(
+      RUNG_LO + (1.0 - clamp(marker.y, 0, 1)) * (RUNG_HI - RUNG_LO)
+    );
+    const baseFreq = ladderFreq(rung);
+
+    // A soft, nearly pure tone forms the centre of the sound. A very slightly
+    // detuned partner adds a slow, natural shimmer without an LFO or siren sweep.
+    const oscA = this.ctx.createOscillator();
+    const oscB = this.ctx.createOscillator();
+    oscA.type = "sine";
+    oscB.type = "sine";
+    oscA.frequency.value = baseFreq;
+    oscB.frequency.value = baseFreq * 1.003;
+
+    const toneMix = this.ctx.createGain();
+    toneMix.gain.value = 0.82;
+    const shimmerMix = this.ctx.createGain();
+    shimmerMix.gain.value = 0.18;
+
+    // Filtered noise gives the tone an airy, breath-like edge. It is kept
+    // deliberately quiet so it reads as atmosphere rather than hiss.
+    const noiseBuffer = this.ctx.createBuffer(
+      1, this.ctx.sampleRate * 2, this.ctx.sampleRate
+    );
+    const noiseData = noiseBuffer.getChannelData(0);
+    for (let i = 0; i < noiseData.length; i++) {
+      noiseData[i] = (Math.random() * 2 - 1) * 0.22;
+    }
+    const noise = this.ctx.createBufferSource();
+    noise.buffer = noiseBuffer;
+    noise.loop = true;
+
+    const noiseFilter = this.ctx.createBiquadFilter();
+    noiseFilter.type = "bandpass";
+    noiseFilter.frequency.value = 1050;
+    noiseFilter.Q.value = 0.45;
+    const noiseGain = this.ctx.createGain();
+    noiseGain.gain.value = 0.11;
+
+    const toneFilter = this.ctx.createBiquadFilter();
+    toneFilter.type = "lowpass";
+    toneFilter.frequency.value = 1750;
+    toneFilter.Q.value = 0.55;
 
     const amp = this.ctx.createGain();
-    amp.gain.value = 0.0001;
+    amp.gain.setValueAtTime(0.0001, now);
 
     const panner = this.ctx.createStereoPanner();
-    panner.pan.value = Math.max(-1, Math.min(1, marker.x * 2 - 1));
+    panner.pan.value = clamp(marker.x * 2 - 1, -1, 1);
 
-    const osc = this.ctx.createOscillator();
-    osc.type = "sine";
-
-    const upper = this.ctx.createOscillator();
-    upper.type = "triangle";
-    const upperGain = this.ctx.createGain();
-    upperGain.gain.value = 0.075;
-
-    // Slow pitch wobble: more like a living, turning fluid structure than
-    // a static drone. Its depth and rate are adjusted as the marker moves.
-    const vibrato = this.ctx.createOscillator();
-    vibrato.type = "sine";
-    vibrato.frequency.value = 0.32;
-    const vibratoDepth = this.ctx.createGain();
-    vibratoDepth.gain.value = 0.6;
-    vibrato.connect(vibratoDepth);
-    vibratoDepth.connect(osc.frequency);
-
-    // Gentle breathing/pulsing, scaled with the voice's own amplitude.
-    const tremolo = this.ctx.createOscillator();
-    tremolo.type = "sine";
-    tremolo.frequency.value = 0.42;
-    const tremoloDepth = this.ctx.createGain();
-    tremoloDepth.gain.value = 0.0;
-    tremolo.connect(tremoloDepth);
-    tremoloDepth.connect(amp.gain);
-
-    osc.connect(filter);
-    upper.connect(upperGain);
-    upperGain.connect(filter);
-    filter.connect(amp);
+    oscA.connect(toneMix);
+    oscB.connect(shimmerMix);
+    toneMix.connect(toneFilter);
+    shimmerMix.connect(toneFilter);
+    noise.connect(noiseFilter);
+    noiseFilter.connect(noiseGain);
+    noiseGain.connect(toneFilter);
+    toneFilter.connect(amp);
     amp.connect(panner);
     panner.connect(this.vortBus);
 
-    osc.start(now);
-    upper.start(now);
-    vibrato.start(now);
-    tremolo.start(now);
+    oscA.start(now);
+    oscB.start(now);
+    noise.start(now);
+
+    // A slow fade-in prevents newly detected markers from clicking into view.
+    amp.gain.linearRampToValueAtTime(VORTEX_BED_GAIN * 0.45, now + 0.65);
 
     const serial = this.vortexVoiceSerial++;
     return {
       x: marker.x,
       y: marker.y,
       q: marker.q,
+      baseFreq,
       phase: serial * 2.399963229728653,
       lastSeen: now,
       releasing: false,
       releaseAt: 0,
-      osc, upper, upperGain, filter, amp, panner,
-      vibrato, vibratoDepth, tremolo, tremoloDepth
+      oscA, oscB, noise, noiseFilter, noiseGain,
+      toneFilter, amp, panner
     };
   }
 
@@ -504,7 +526,7 @@ class WebSonifier {
       if (!Number.isFinite(mk.x) || !Number.isFinite(mk.y)) continue;
 
       // Match this frame's marker to the nearest existing voice in the
-      // same quadrant. The JSON markers have no persistent ID, so position
+      // same quadrant. Marker records have no persistent ID, so position
       // continuity is used to follow each vortex between frames.
       let best = null;
       let bestDist = VORTEX_MATCH_DIST;
@@ -531,63 +553,60 @@ class WebSonifier {
         continue;
       }
 
-      // Smooth marker motion so pitch and pan do not jump from frame to frame.
-      best.x = 0.65 * mk.x + 0.35 * best.x;
-      best.y = 0.65 * mk.y + 0.35 * best.y;
+      // Smooth marker motion. Position affects stereo placement, not pitch.
+      best.x = 0.10 * mk.x + 0.90 * best.x;
+      best.y = 0.10 * mk.y + 0.90 * best.y;
       best.q = mk.q;
       best.lastSeen = now;
       best.releasing = false;
 
-      const rung = RUNG_LO + (1.0 - clamp(best.y, 0, 1)) * (RUNG_HI - RUNG_LO);
-      const freq = ladderFreq(Math.round(rung));
       const sizePx = Math.max(0, (mk.r || 0) * (sonData ? sonData.width : 640));
       const sizeFactor = clamp(sizePx / 34.0, 0, 1);
 
-      // Larger vortices have a fuller, slightly brighter sustained body.
-      // Marker size is used here because it is present in the supplied
-      // sonification_data.json marker records.
+      // Keep the sound soft and airy: size gently opens the filter and adds
+      // a little breath, but does not cause a dramatic change in loudness.
       const baseAmp = shouldSound
-        ? VORTEX_BED_GAIN * (0.55 + 0.45 * sizeFactor)
-        : 0.0;
+        ? VORTEX_BED_GAIN * (0.72 + 0.28 * sizeFactor)
+        : 0.0001;
 
-      best.osc.frequency.setTargetAtTime(freq, now, 0.16);
-      best.upper.frequency.setTargetAtTime(freq * 2.01, now, 0.16);
-      best.filter.frequency.setTargetAtTime(900 + 1900 * sizeFactor, now, 0.22);
-      best.vibrato.frequency.setTargetAtTime(0.22 + 0.22 * (1 - sizeFactor), now, 0.25);
-      best.vibratoDepth.gain.setTargetAtTime(0.35 + 0.9 * sizeFactor, now, 0.25);
-      best.tremolo.frequency.setTargetAtTime(0.28 + 0.32 * (1 - sizeFactor), now, 0.25);
+      best.toneFilter.frequency.setTargetAtTime(
+        1250 + 850 * sizeFactor, now, 0.65
+      );
+      best.noiseFilter.frequency.setTargetAtTime(
+        850 + 500 * sizeFactor, now, 0.75
+      );
+      best.noiseGain.gain.setTargetAtTime(
+        0.075 + 0.055 * sizeFactor, now, 0.75
+      );
 
-      // The stereo position follows the vortex, with a slow orbit layered on top.
+      // Follow the marker's location very gently. The slow, shallow drift
+      // adds width without the conspicuous circular sweep of the old version.
       const basePan = clamp(best.x * 2 - 1, -1, 1);
-      const orbitHz = 0.10 + 0.18 * (1 - sizeFactor);
-      const orbitDepth = 0.10 + 0.12 * (1 - sizeFactor);
-      const orbit = Math.sin(now * 2 * Math.PI * orbitHz + best.phase) * orbitDepth;
-      best.panner.pan.setTargetAtTime(clamp(basePan + orbit, -1, 1), now, 0.10);
-
-      best.amp.gain.setTargetAtTime(Math.max(0.0001, baseAmp * 0.78), now, 0.13);
-      best.tremoloDepth.gain.setTargetAtTime(baseAmp * 0.22, now, 0.13);
+      const drift = Math.sin(now * 2 * Math.PI * 0.035 + best.phase) * 0.045;
+      best.panner.pan.setTargetAtTime(
+        clamp(basePan + drift, -1, 1), now, 0.55
+      );
+      best.amp.gain.setTargetAtTime(baseAmp, now, 0.55);
     }
 
-    // A vortex that is no longer detected fades away rather than stopping
-    // abruptly. If it reappears shortly afterwards, its voice can be reused.
+    // A vortex that disappears fades away gradually instead of stopping abruptly.
     for (const voice of unmatched) {
       if (!voice.releasing) {
         voice.releasing = true;
         voice.releaseAt = now;
       }
       voice.amp.gain.setTargetAtTime(0.0001, now, VORTEX_RELEASE_SEC);
-      voice.tremoloDepth.gain.setTargetAtTime(0.0, now, 0.10);
+      voice.noiseGain.gain.setTargetAtTime(0.0001, now, VORTEX_RELEASE_SEC);
     }
 
     this.vortexVoices = this.vortexVoices.filter(voice => {
-      if (voice.releasing && now - voice.releaseAt > 1.6) {
-        for (const node of [voice.osc, voice.upper, voice.vibrato, voice.tremolo]) {
+      if (voice.releasing && now - voice.releaseAt > 2.8) {
+        for (const node of [voice.oscA, voice.oscB, voice.noise]) {
           try { node.stop(now); } catch (_) {}
         }
         for (const node of [
-          voice.osc, voice.upper, voice.upperGain, voice.filter, voice.amp,
-          voice.panner, voice.vibrato, voice.vibratoDepth,
-          voice.tremolo, voice.tremoloDepth
+          voice.oscA, voice.oscB, voice.noise, voice.noiseFilter,
+          voice.noiseGain, voice.toneFilter, voice.amp, voice.panner
         ]) {
           try { node.disconnect(); } catch (_) {}
         }
@@ -634,7 +653,7 @@ class WebSonifier {
     const cData = clickBuf.getChannelData(0);
     for (let i = 0; i < cData.length; i++) {
       const t = i / this.ctx.sampleRate;
-      cData[i] = (Math.random() * 2 - 1) * Math.exp(-t / 0.004) * 0.15 * ev.vel;
+      cData[i] = (Math.random() * 2 - 1) * Math.exp(-t / 0.006) * 0.045 * ev.vel;
     }
     const noise = this.ctx.createBufferSource();
     noise.buffer = clickBuf;
@@ -957,7 +976,7 @@ function drawDashboard(ctx, fData, curT) {
 
   ctx.fillStyle = "#ebebeb";
   ctx.font = "bold 14px sans-serif";
-  ctx.fillText("THE EBBS AND WHIRLS OF CO2", 18, 26);
+  ctx.fillText("The ebbs and whirls of CO2", 18, 26);
 
   let modeTxt = selectedQuad === -1
     ? "LISTENING: ALL 4 QUADRANTS (STEREO CHORD)"
