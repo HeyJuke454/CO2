@@ -227,7 +227,7 @@ const QUAD_COLORS = ["#3cc8ff", "#ffaa3c", "#8cff6e", "#e66eff"];
 const MALLET_PARTIALS = [[1.0, 1.00, 1.00], [4.0, 0.35, 0.35], [6.0, 0.12, 0.18]];
 const SMOOTH_SEC_C = 0.05;
 const SMOOTH_STAGES = 5;
-const BIN_EMPHASIS = 2.0;   // higher = high bins stand out more
+const BIN_EMPHASIS = 3.0;   // higher = high bins stand out more
 const BIN_FLOOR = 0.05;     // how much bin .0 keeps (0 = silent)
 const BIN_BOOST = Array.from({length: N_BINS}, (_, b) =>
   BIN_FLOOR + (1 - BIN_FLOOR) * Math.pow(b / (N_BINS - 1), BIN_EMPHASIS));
