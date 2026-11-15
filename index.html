@@ -212,13 +212,13 @@ const CONC_NAMES = QUAD_META.map(m => Array.from({length: N_BINS}, (_, b) => lad
 
 const CONC_DETUNE = 0.0018;
 const BREATH_HZ = Array.from({length: N_BINS}, (_, i) => 0.08 + (0.22 - 0.08) * (i / (N_BINS - 1)));
-const CONC_GAIN = 1.2;
+const CONC_GAIN = 0.5;
 const VORT_GAIN = 1.0;
 
 // Sustained vortex layer: soft, breath-like tones rather than a siren-like
 // pitch sweep. Each vortex keeps the note it starts on; motion is expressed
 // mostly through gentle spatial drift and a quiet filtered-noise layer.
-const VORTEX_BED_GAIN = 0.090;
+const VORTEX_BED_GAIN = 0.120;
 const VORTEX_BED_MAX_VOICES = 16;
 const VORTEX_MATCH_DIST = 0.14;       // normalized position tolerance
 const VORTEX_RELEASE_SEC = 0.75;
